@@ -29,6 +29,45 @@
 
 import hashlib
 
+# 规则与覆盖审计共用的问题码固定输出顺序（validate_policy 去重后按此排列）。
+_ISSUE_ORDER = (
+    "rule_without_priority",
+    "percent_without_tenant_restriction",
+    "override_without_audit",
+    "percent_out_of_range",
+)
+
+
+def _strict_equal(left, right) -> bool:
+    """零容差相等：类型必须一致，字典/列表递归按值完全相等。"""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _strict_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _strict_equal(a, b) for a, b in zip(left, right)
+        )
+    return left == right
+
+
+def _valid_audit(audit) -> bool:
+    """审计字段必须是非空字典，且 actor/at/reason 都是非空字符串。"""
+    if not isinstance(audit, dict) or not audit:
+        return False
+    for field in ("actor", "at", "reason"):
+        value = audit.get(field)
+        if not isinstance(value, str) or not value:
+            return False
+    return True
+
+
+def _is_real_int(value) -> bool:
+    """整数判定，排除 bool（bool 仅是 int 的子类型，不算配置中的整数）。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
 
 def bucket_of(tenant: str, flag: str) -> int:
     """计算 tenant 在 flag 上的确定性分桶，结果落在 0 到 99。
@@ -55,7 +94,11 @@ def bucket_of(tenant: str, flag: str) -> int:
       彼此独立的分桶，否则所有开关会对同一批租户同时放量或同时关闭。
     - 结果必须落在闭区间 0 到 99。
     """
-    raise NotImplementedError("bucket_of 尚未实现，契约见 docstring")
+    # 确定性哈希，绝不使用 random/时间/计数器；种子顺序固定为 flag 在前、
+    # tenant 在后，中间用单元分隔符 \x1f 隔开，保证两个字段都参与且无拼接歧义。
+    seed = flag + "\x1f" + tenant
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 100
 
 
 def rule_matches(rule: dict, context: dict) -> bool:
@@ -93,7 +136,34 @@ def rule_matches(rule: dict, context: dict) -> bool:
     - 属性比较零容差：字符串不做大小写折叠，数字类型不做宽松转换，列表与字典
       按值完全相等。
     """
-    raise NotImplementedError("rule_matches 尚未实现，契约见 docstring")
+    context = context if isinstance(context, dict) else {}
+    context_attrs = context.get("attrs")
+    context_attrs = context_attrs if isinstance(context_attrs, dict) else {}
+    context_tenant = context.get("tenant", "")
+
+    # 条件 1：租户。tenants 缺失或为空表示不限租户；否则必须完全相等命中其一。
+    rule_tenants = rule.get("tenants") or []
+    if rule_tenants and context_tenant not in rule_tenants:
+        return False
+
+    # 条件 2：属性。规则要求的每个键都必须在上下文里，且类型与值完全相等。
+    for key, expected in (rule.get("attrs") or {}).items():
+        if key not in context_attrs:
+            return False
+        if not _strict_equal(context_attrs[key], expected):
+            return False
+
+    # 条件 3：百分比。percent 缺失视为 100；严格小于，0 永不命中，100 必通过。
+    if "percent" in rule:
+        if "flag" not in rule:
+            raise ValueError("带 percent 的规则必须提供 flag 作为分桶种子")
+        percent = rule["percent"]
+        if not _is_real_int(percent) or not 0 <= percent <= 100:
+            raise ValueError("percent 必须是 0 到 100 的整数")
+        if bucket_of(context_tenant, rule["flag"]) >= percent:
+            return False
+
+    return True
 
 
 def evaluate(flag: str, context: dict, policy: dict) -> dict:
@@ -136,7 +206,40 @@ def evaluate(flag: str, context: dict, policy: dict) -> dict:
       ``allowed`` 为 False；百分比规则不能把外部租户放进来。
     - 不修改 ``context`` 与 ``policy``；比较零容差。
     """
-    raise NotImplementedError("evaluate 尚未实现，契约见 docstring")
+    default_variant = policy.get("default_variant")
+
+    # 第 1 步：租户白名单，默认拒绝。不通过时绝不进入覆盖、规则与百分比逻辑，
+    # 百分比因此不可能成为外部租户的入口。
+    if not tenant_scope_ok(context, policy):
+        return {"variant": default_variant, "matched_rule": None, "allowed": False}
+
+    tenant = context.get("tenant", "") if isinstance(context, dict) else ""
+
+    # 第 2 步：合法覆盖（管理员且带审计）优先于所有规则。
+    override = override_for(tenant, flag, policy.get("overrides") or [])
+    if override:
+        return {
+            "variant": override["variant"],
+            "matched_rule": None,
+            "allowed": True,
+        }
+
+    # 第 3 步：按 priority 降序、同优先级按 id 字典序升序，命中即停，
+    # 不看声明顺序，也不允许后命中的规则覆盖先命中的结果。
+    rules = sorted(
+        policy.get("rules") or [],
+        key=lambda rule: (-rule["priority"], rule["id"]),
+    )
+    for rule in rules:
+        if rule_matches(rule, context):
+            return {
+                "variant": rule["variant"],
+                "matched_rule": rule["id"],
+                "allowed": True,
+            }
+
+    # 第 4 步：没有任何规则命中，返回默认变体（白名单已通过，allowed 为 True）。
+    return {"variant": default_variant, "matched_rule": None, "allowed": True}
 
 
 def tenant_scope_ok(context: dict, policy: dict) -> bool:
@@ -163,7 +266,19 @@ def tenant_scope_ok(context: dict, policy: dict) -> bool:
       没有租户被放行，而不是全部放行。
     - 上下文不是 dict、缺少 tenant 或 tenant 为空串时返回 False。
     """
-    raise NotImplementedError("tenant_scope_ok 尚未实现，契约见 docstring")
+    if not isinstance(context, dict):
+        return False
+    tenant = context.get("tenant")
+    if not isinstance(tenant, str) or tenant == "":
+        return False
+
+    whitelist = policy.get("tenant_whitelist") if isinstance(policy, dict) else None
+    # 白名单缺失、不是列表或为空：默认拒绝，而不是全部放行。
+    if not isinstance(whitelist, list) or not whitelist:
+        return False
+
+    # 逐字符完全相等，禁止前缀/后缀/包含/大小写折叠比较。
+    return tenant in whitelist
 
 
 def percentage_rollout(tenant: str, percent: int) -> bool:
@@ -192,7 +307,11 @@ def percentage_rollout(tenant: str, percent: int) -> bool:
       :func:`tenant_scope_ok` 再使用本函数，百分比不能成为外部租户的入口。
     - percent 不是 0 到 100 的整数时抛 ``ValueError``。
     """
-    raise NotImplementedError("percentage_rollout 尚未实现，契约见 docstring")
+    if not _is_real_int(percent) or not 0 <= percent <= 100:
+        raise ValueError("percent 必须是 0 到 100 的整数")
+    # 固定开关名 "rollout" 作为分桶种子，结果对同一租户永远稳定；
+    # 本函数不检查白名单，调用方必须先通过 tenant_scope_ok。
+    return bucket_of(tenant, "rollout") < percent
 
 
 def override_for(tenant: str, flag: str, overrides: list) -> dict:
@@ -234,7 +353,28 @@ def override_for(tenant: str, flag: str, overrides: list) -> dict:
       无法追责。
     - 返回浅拷贝，不得返回策略内部对象本身，避免调用方改到策略数据。
     """
-    raise NotImplementedError("override_for 尚未实现，契约见 docstring")
+    if not overrides:
+        return {}
+
+    for record in overrides:
+        if not isinstance(record, dict):
+            continue
+        # tenant 与 flag 同时完全相等才算命中，不做前缀或大小写匹配。
+        if record.get("tenant") != tenant or record.get("flag") != flag:
+            continue
+
+        # 写入权限：仅管理员可用，任何其他角色直接拒绝。
+        if record.get("actor_role") != "admin":
+            raise PermissionError("只有管理员可以写入覆盖记录")
+
+        # 审计：必须有完整的 actor/at/reason 非空字符串，否则覆盖不可用。
+        if not _valid_audit(record.get("audit")):
+            raise ValueError("覆盖记录缺少合法审计字段，无法追责")
+
+        # 返回浅拷贝，避免调用方改到策略内部对象。
+        return dict(record)
+
+    return {}
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -265,7 +405,30 @@ def validate_policy(policy: dict) -> list[str]:
     - 必须真正检查百分比放量是否有租户限制，不能只看字段是否存在。
     - 只校验、不修改 ``policy``，也不抛异常；字段缺失按对应问题码报告。
     """
-    raise NotImplementedError("validate_policy 尚未实现，契约见 docstring")
+    issues = set()
+
+    for rule in policy.get("rules") or []:
+        rule = rule if isinstance(rule, dict) else {}
+
+        priority = rule.get("priority")
+        if not _is_real_int(priority) or priority < 0:
+            issues.add("rule_without_priority")
+
+        if "percent" in rule:
+            percent = rule["percent"]
+            if not _is_real_int(percent) or not 0 <= percent <= 100:
+                issues.add("percent_out_of_range")
+            else:
+                # 非全量放量却没有任何租户限制：百分比会成为外部租户入口。
+                if percent < 100 and not rule.get("tenants"):
+                    issues.add("percent_without_tenant_restriction")
+
+    for record in policy.get("overrides") or []:
+        record = record if isinstance(record, dict) else {}
+        if not _valid_audit(record.get("audit")):
+            issues.add("override_without_audit")
+
+    return [code for code in _ISSUE_ORDER if code in issues]
 
 
 def flag_batch(contexts: list[dict], policy: dict) -> dict:
@@ -292,4 +455,17 @@ def flag_batch(contexts: list[dict], policy: dict) -> dict:
     - 两批独立调用互不影响，批量结果必须与逐个调用 :func:`evaluate` 的结果
       完全相同。
     """
-    raise NotImplementedError("flag_batch 尚未实现，契约见 docstring")
+    flag = policy.get("flag")
+    results = {}
+
+    for context in contexts:
+        # 每个上下文独立调用 evaluate：不缓存、不共享可变状态，后一个请求
+        # 不可能继承前一个请求的 tenant 或 attrs；evaluate 本身不修改入参。
+        result = evaluate(flag, context, policy)
+        key = context.get("request_id")
+        if key is None:
+            # request_id 缺失时退回用 tenant 作为键。
+            key = context.get("tenant")
+        results[key] = result
+
+    return results
